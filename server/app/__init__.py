@@ -1,0 +1,1 @@
+"""VIT Backend Application."""

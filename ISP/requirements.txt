@@ -1,0 +1,8 @@
+# ISP dependencies (Python 3.8-3.11, use with CUDA for GPU)
+torch>=2.0,<2.3
+torchvision
+trimesh
+scipy
+numpy
+# PyTorch3D: install separately if needed, e.g. pip install "git+https://github.com/facebookresearch/pytorch3d.git"
+pytorch3d

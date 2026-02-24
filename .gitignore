@@ -1,0 +1,54 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+.venv/
+*.egg-info/
+
+# Build outputs
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-*
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# App-specific uploads and output
+server/uploads/*
+server/output/*
+!server/uploads/.gitkeep
+!server/output/.gitkeep
+
+# Large model checkpoints (download separately)
+ISP/checkpoints/*.pth
+ISP/extra-data/*.pt
+ISP/extra-data/*.npz
+ISP/extra-data/fitting-sample/
+ISP/extra-data/meshes/
+server/assets/SMPL_python_v.1.1.0/
+server/app/assets/smpl/*.pkl
+ISP/smpl_pytorch/*.pkl
+server/*.glb
+
+# ISP worktrees
+ISP.worktrees/
+
+# Temp/debug scripts
+server/_patch*.py
+server/_diag*.py
+server/_trace*.py
+server/test_*.py
+
+# Logs
+*.log

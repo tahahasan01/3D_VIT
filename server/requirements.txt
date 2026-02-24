@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-multipart
+trimesh[easy]>=4.0.0
+numpy>=1.24,<2.4
+Pillow
+rembg[cpu]
+scipy
+pydantic
+python-dotenv
+pygltflib>=1.16

@@ -1,0 +1,63 @@
+@import "tailwindcss";
+
+/*
+ * Custom theme for VIT.
+ *
+ * Tailwind CSS v4 uses CSS-based configuration via @theme.
+ * Brand colours and font overrides are defined here.
+ */
+
+@theme {
+  --color-brand-50: #f0f5ff;
+  --color-brand-100: #e0eaff;
+  --color-brand-200: #c7d7fe;
+  --color-brand-300: #a4bcfd;
+  --color-brand-400: #8098f9;
+  --color-brand-500: #6172f3;
+  --color-brand-600: #444ce7;
+  --color-brand-700: #3538cd;
+  --color-brand-800: #2d31a6;
+  --color-brand-900: #2d3282;
+
+  --font-sans: "Inter", system-ui, -apple-system, sans-serif;
+}
+
+/*
+ * Base layer resets.
+ */
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    overflow-y: scroll;
+  }
+
+  *:focus {
+    outline: none;
+  }
+
+  * {
+    scroll-behavior: smooth;
+  }
+}
+
+/*
+ * Custom scrollbar for sidebar panels.
+ */
+
+@layer components {
+  .overflow-y-auto::-webkit-scrollbar {
+    width: 6px;
+  }
+  .overflow-y-auto::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .overflow-y-auto::-webkit-scrollbar-thumb {
+    background-color: #d1d5db;
+    border-radius: 3px;
+  }
+  .overflow-y-auto::-webkit-scrollbar-thumb:hover {
+    background-color: #9ca3af;
+  }
+}
