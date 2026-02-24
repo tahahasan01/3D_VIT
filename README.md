@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/vit-demo.png" alt="VIT - 3D Virtual Try-On" width="100%" />
+  <img src="Dashboard.png" alt="VIT - 3D Virtual Try-On" width="100%" />
 </p>
 
 <h1 align="center">VIT — 3D Virtual Interactive Try-On</h1>
@@ -48,7 +48,7 @@ The garment generation pipeline uses **ISP** (Implicit Sewing Patterns — Li et
 ## Demo
 
 <p align="center">
-  <img src="docs/vit-demo.png" alt="VIT Try-On Demo" width="90%" />
+  <img src="Dashboard.png" alt="VIT Try-On Demo" width="90%" />
 </p>
 
 > **3-step wizard:** (1) Enter body measurements → generate 3D body, (2) Upload a garment photo → generate textured 3D garment, (3) Inspect the fitted result in the interactive 3D viewer with animations.
