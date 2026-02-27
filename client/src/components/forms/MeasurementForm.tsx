@@ -15,6 +15,7 @@ import type { BodyMeasurements, Gender } from "../../types/body";
 import {
   DEFAULT_MALE_MEASUREMENTS,
   DEFAULT_FEMALE_MEASUREMENTS,
+  DEFAULT_SKIN_COLOR_HEX,
 } from "../../types/body";
 
 interface MeasurementFormProps {
@@ -136,6 +137,40 @@ export function MeasurementForm({ isLoading, onSubmit }: MeasurementFormProps) {
             Use SMPL body (realistic, animation-ready; requires SMPL files in server)
           </span>
         </label>
+
+        <div className="flex flex-col gap-1">
+          <label className="text-sm font-medium text-gray-700">Skin color</label>
+          <div className="flex items-center gap-2">
+            <input
+              type="color"
+              value={form.skin_color_hex ?? DEFAULT_SKIN_COLOR_HEX}
+              onChange={(e) =>
+                setForm((prev) => ({
+                  ...prev,
+                  skin_color_hex: e.target.value || undefined,
+                }))
+              }
+              className="h-9 w-14 cursor-pointer rounded border border-gray-300 bg-transparent p-0"
+              title="Skin color"
+            />
+            <input
+              type="text"
+              value={form.skin_color_hex ?? DEFAULT_SKIN_COLOR_HEX}
+              onChange={(e) => {
+                const v = e.target.value.trim();
+                setForm((prev) => ({
+                  ...prev,
+                  skin_color_hex: v || undefined,
+                }));
+              }}
+              placeholder={DEFAULT_SKIN_COLOR_HEX}
+              className="flex-1 rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-brand-500"
+            />
+          </div>
+          <span className="text-xs text-gray-500">
+            Optional. Hex color for body skin (e.g. #E8C4A0).
+          </span>
+        </div>
 
         <Button type="submit" isLoading={isLoading} className="mt-2">
           <Ruler className="h-4 w-4" />

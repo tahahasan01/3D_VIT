@@ -9,7 +9,7 @@ from __future__ import annotations
 import io
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 from rembg import remove
 
 # Max dimension for rembg input to avoid ONNX "bad allocation" on large images
@@ -64,53 +64,221 @@ def _is_mostly_solid_color(image: Image.Image, threshold_std: float = 48.0) -> b
     return float(np.std(rgb)) < threshold_std
 
 
+def _crop_to_opaque_bbox(image: Image.Image) -> Image.Image:
+    """Crop an RGBA image to the bounding box of opaque (alpha > 128) pixels."""
+    arr = np.array(image)
+    if arr.ndim < 3 or arr.shape[2] < 4:
+        return image
+    opaque = arr[:, :, 3] > 128
+    if not np.any(opaque):
+        return image
+    rows = np.any(opaque, axis=1)
+    cols = np.any(opaque, axis=0)
+    r_min, r_max = int(np.where(rows)[0][0]), int(np.where(rows)[0][-1])
+    c_min, c_max = int(np.where(cols)[0][0]), int(np.where(cols)[0][-1])
+    return image.crop((c_min, r_min, c_max + 1, r_max + 1))
+
+
+def _harden_alpha(image: Image.Image, threshold: int = 128) -> Image.Image:
+    """Binarize alpha channel: above threshold → 255, below → 0.
+
+    Prevents semi-transparent background pixels (rembg artifacts) from
+    leaking sky, nets, trees, etc. into the final texture.
+    """
+    arr = np.array(image)
+    if arr.ndim < 3 or arr.shape[2] < 4:
+        return image
+    alpha = arr[:, :, 3]
+    alpha = np.where(alpha >= threshold, 255, 0).astype(np.uint8)
+    arr[:, :, 3] = alpha
+    return Image.fromarray(arr, "RGBA")
+
+
+def _clean_image(image: Image.Image) -> tuple[Image.Image, Image.Image, tuple[int, int, int]]:
+    """Shared pre-processing for prepare_texture: harden alpha, erode fringe, crop, flatten."""
+    fill_rgb = extract_dominant_color(image, avoid_white=False, use_center_region=False)
+
+    img_copy = _harden_alpha(image.copy().convert("RGBA"), threshold=48)
+
+    try:
+        alpha_ch = img_copy.split()[3]
+        alpha_ch = alpha_ch.filter(ImageFilter.MinFilter(5))
+        img_copy.putalpha(alpha_ch)
+    except Exception:
+        pass
+
+    img_copy = _crop_to_opaque_bbox(img_copy)
+    iw, ih = img_copy.size
+    if iw < 1 or ih < 1:
+        return Image.new("RGB", (1, 1), fill_rgb), img_copy, fill_rgb
+
+    img_flat = Image.new("RGB", (iw, ih), fill_rgb)
+    if img_copy.mode == "RGBA":
+        img_flat.paste(img_copy.convert("RGB"), mask=img_copy.split()[3])
+    else:
+        img_flat = img_copy.convert("RGB")
+
+    return img_flat, img_copy, fill_rgb
+
+
 def prepare_texture(
     image: Image.Image,
     target_size: tuple[int, int] = (1024, 1024),
     avoid_white_fill: bool = False,
+    frontal: bool = False,
+    back_image: Image.Image | None = None,
 ) -> Image.Image:
-    """Centre the garment image on a square texture canvas.
+    """Prepare the garment image as a texture for 3D mapping.
 
-    The garment is scaled to fill *target_size* (cover) so it occupies most of
-    the texture and the uploaded color/print is visible. Padding uses the
-    dominant garment color so any UV bleed matches the garment.
-    For nearly solid-color images (e.g. plain red shirt), the entire texture
-    is filled with that color so the 3D garment shows the correct color
-    regardless of UV mapping.
+    Parameters
+    ----------
+    frontal : bool
+        When *True* (pants / front-back projection UVs), produces a
+        **dual-half texture atlas** – left half for front-facing vertices,
+        right half for back-facing vertices.  If *back_image* is supplied
+        it fills the right half; otherwise a blurred copy of the front
+        is used so front-only details (buttons, fly) don't appear on
+        the back of the mesh.
+
+        When *False* (cylindrical UVs, default for shirts), uses a
+        two-layer approach: blurred cover-crop base + crisp fit-mode
+        overlay centred on the front of the cylindrical mesh.
+
+    back_image : Image.Image, optional
+        RGBA image of the garment's back view (already background-removed).
+        Used only when *frontal=True*.
     """
-    # use_center_region when avoiding white so solid dark colors (grey, black) aren't pulled to white by rembg edges
     fill_rgb = extract_dominant_color(image, avoid_white=avoid_white_fill, use_center_region=avoid_white_fill)
-    # Never use white as solid fill when we have a colored garment (rembg can leave white dominating)
     if avoid_white_fill and all(c >= 230 for c in fill_rgb):
         fill_rgb = extract_dominant_color(image, avoid_white=True, use_center_region=True)
 
-    # Solid-color garment: fill whole texture so color is correct everywhere (and backend will use vertex colors)
-    if _is_mostly_solid_color(image, threshold_std=55.0):
-        return Image.new("RGB", target_size, fill_rgb)
-    # If dominant color is strongly saturated (e.g. clear red / dark green), use slightly looser solid check
-    if _is_mostly_solid_color(image, threshold_std=68.0) and max(abs(c - 128) for c in fill_rgb) > 30:
-        return Image.new("RGB", target_size, fill_rgb)
-    # When avoiding white and we have a clear non-white dominant color with mostly solid image, force solid fill so vertex colors are used
-    if avoid_white_fill and any(c < 230 for c in fill_rgb) and _is_mostly_solid_color(image, threshold_std=72.0):
+    if _is_mostly_solid_color(image, threshold_std=3.0):
         return Image.new("RGB", target_size, fill_rgb)
 
-    img_copy = image.copy().convert("RGBA")
-    w, h = target_size[0], target_size[1]
-    iw, ih = img_copy.size
+    img_flat, img_copy, _ = _clean_image(image)
+    iw, ih = img_flat.size
+    if iw < 1 or ih < 1:
+        return Image.new("RGB", target_size, fill_rgb)
 
-    # Scale to fill then center-crop so the garment stays centered; front-facing UV band samples this center
-    scale = max(w / iw, h / ih)
+    back_img_flat: Image.Image | None = None
+    if frontal and back_image is not None:
+        back_img_flat, _, _ = _clean_image(back_image)
+
+    if frontal:
+        return _prepare_frontal_texture(img_flat, img_copy, fill_rgb, target_size, back_img_flat=back_img_flat)
+    return _prepare_cylindrical_texture(img_flat, img_copy, fill_rgb, target_size)
+
+
+def _fill_half(
+    img: Image.Image,
+    fill_rgb: tuple[int, int, int],
+    half_w: int,
+    half_h: int,
+) -> Image.Image:
+    """Scale *img* to cover a (half_w × half_h) region (cover-crop)."""
+    iw, ih = img.size
+    scale = max(half_w / max(iw, 1), half_h / max(ih, 1))
     new_w = max(1, int(iw * scale))
     new_h = max(1, int(ih * scale))
-    img_copy = img_copy.resize((new_w, new_h), Image.Resampling.LANCZOS)
-    x0 = (new_w - w) // 2
-    y0 = (new_h - h) // 2
-    img_copy = img_copy.crop((x0, y0, x0 + w, y0 + h))
+    img_s = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    x0 = max(0, (new_w - half_w) // 2)
+    y0 = max(0, (new_h - half_h) // 2)
+    return img_s.crop((x0, y0, x0 + half_w, y0 + half_h))
 
-    canvas = Image.new("RGBA", target_size, (*fill_rgb, 255))
-    canvas.paste(img_copy, (0, 0), img_copy)
 
+def _prepare_frontal_texture(
+    img_flat: Image.Image,
+    img_rgba: Image.Image,
+    fill_rgb: tuple[int, int, int],
+    target_size: tuple[int, int],
+    back_img_flat: Image.Image | None = None,
+) -> Image.Image:
+    """Dual-half texture atlas for pants (front-back projection UVs).
+
+    Layout (matches ``assign_pants_uvs``):
+
+        ┌──────────────┬──────────────┐
+        │  LEFT HALF   │  RIGHT HALF  │
+        │  Front view  │  Back view   │
+        │  U = 0 – 0.5 │  U = 0.5 – 1 │
+        └──────────────┴──────────────┘
+
+    * **Left half** – the front garment photo, cover-cropped.
+    * **Right half** – the back photo (if provided) or a blurred version
+      of the front so no front-only details (buttons, fly) leak onto the
+      back of the mesh.
+    """
+    tw, th = target_size
+    half_w = tw // 2
+
+    front_half = _fill_half(img_flat, fill_rgb, half_w, th)
+
+    if back_img_flat is not None:
+        back_half = _fill_half(back_img_flat, fill_rgb, half_w, th)
+    else:
+        back_half = front_half.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+
+    canvas = Image.new("RGB", target_size, fill_rgb)
+    canvas.paste(front_half, (0, 0))
+    canvas.paste(back_half, (half_w, 0))
     return canvas
+
+
+def _prepare_cylindrical_texture(
+    img_flat: Image.Image,
+    img_rgba: Image.Image,
+    fill_rgb: tuple[int, int, int],
+    target_size: tuple[int, int],
+) -> Image.Image:
+    """Texture for cylindrical UVs (shirts / upper-body).
+
+    Cover-crop + depth-blur: the garment photo is scaled to **fully
+    cover** the texture (no fill_rgb gaps), so the fabric wraps
+    everywhere — sleeves, collar, back.  A smooth blur gradient fades
+    details toward the back (left/right edges of the texture) so
+    text / logos stay crisp on the front but don't wrap to the back.
+    Edge columns are mirror-blended for a seamless back seam.
+    """
+    tw, th = target_size
+    iw, ih = img_flat.size
+
+    # Cover-crop: scale garment to fully fill the texture
+    scale = max(tw / max(iw, 1), th / max(ih, 1))
+    cover_w = max(1, int(iw * scale))
+    cover_h = max(1, int(ih * scale))
+    img_full = img_flat.resize((cover_w, cover_h), Image.Resampling.LANCZOS)
+    cx = max(0, (cover_w - tw) // 2)
+    cy = max(0, (cover_h - th) // 2)
+    crisp = img_full.crop((cx, cy, cx + tw, cy + th))
+
+    # Blurred copy for back / sides
+    blur_r = max(1, min(tw, th) // 18)
+    blurred = crisp.filter(ImageFilter.GaussianBlur(radius=blur_r))
+
+    arr_crisp = np.array(crisp, dtype=np.float64)
+    arr_blur = np.array(blurred, dtype=np.float64)
+
+    # Blend weight: 1.0 at front-center (U≈0.5), 0.0 at back (U≈0/1).
+    # Cylindrical UVs map the front to [0.25, 0.75] of the texture width.
+    u = np.linspace(0.0, 1.0, tw)
+    dist = np.abs(u - 0.5)
+    weight = np.clip(1.0 - (dist - 0.18) / 0.14, 0.0, 1.0)
+    weight = weight * weight * (3.0 - 2.0 * weight)  # smooth-step
+    w = weight[np.newaxis, :, np.newaxis]
+
+    arr = arr_blur * (1.0 - w) + arr_crisp * w
+
+    # Seamless back: mirror-blend left/right edges (U=0 ≈ U=1)
+    seam_w = max(1, tw // 8)
+    for i in range(seam_w):
+        t = 1.0 - (i / seam_w)
+        mirror_col = tw - 1 - i
+        left_orig = arr[:, i].copy()
+        right_orig = arr[:, mirror_col].copy()
+        arr[:, i] = (1 - t) * left_orig + t * right_orig
+        arr[:, mirror_col] = (1 - t) * right_orig + t * left_orig
+
+    return Image.fromarray(arr.clip(0, 255).astype(np.uint8), "RGB")
 
 
 def _crop_to_upper_body(

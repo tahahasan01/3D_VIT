@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pickle
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, NotRequired
 
 import numpy as np
 import trimesh
@@ -21,7 +21,7 @@ import trimesh
 from ..models.body import BodyMeasurements, Gender
 from ..utils.mesh_helpers import apply_face_color
 
-_SKIN_COLOR = (222, 195, 170, 255)
+_SKIN_COLOR = (200, 200, 200, 255)
 
 # SMPL model folder; must contain SMPL_MALE.pkl / SMPL_FEMALE.pkl (numpy-only)
 _SMPL_MODEL_DIR = Path(__file__).resolve().parent.parent / "assets" / "smpl"
@@ -57,6 +57,7 @@ class SkinningData(TypedDict):
     weights: np.ndarray            # (6890, 24) float64 — skinning weights
     kintree_parents: np.ndarray    # (24,) int — parent joint index for each joint
     joints_positions: np.ndarray   # (24, 3) float64 — rest-pose joint positions
+    head_face_indices: NotRequired[np.ndarray]  # (N,) int — face indices for head (face texture)
 
 
 def _smpl_path_for_gender(gender: Gender) -> Path | None:
@@ -80,6 +81,30 @@ def _lbs_forward(
     """
     n_betas = min(betas.shape[0], shapedirs.shape[2])
     return v_template + np.einsum("vci,i->vc", shapedirs[:, :, :n_betas], betas[:n_betas])
+
+
+def _get_head_face_indices(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    neck_y: float,
+    head_joint_pos: np.ndarray,
+    *,
+    y_margin_below: float = 0.02,
+    y_margin_above: float = 0.05,
+    horizontal_radius: float = 0.18,
+) -> np.ndarray:
+    """Return face indices whose centroid is in the head region (above neck, near head joint)."""
+    head_x, head_y, head_z = head_joint_pos[0], head_joint_pos[1], head_joint_pos[2]
+    y_min = neck_y + y_margin_below
+    y_max = head_y + y_margin_above
+    # Face centroids
+    centroids = vertices[faces].mean(axis=1)  # (F, 3)
+    in_y = (centroids[:, 1] >= y_min) & (centroids[:, 1] <= y_max)
+    dx = centroids[:, 0] - head_x
+    dz = centroids[:, 2] - head_z
+    in_radius = (dx * dx + dz * dz) <= (horizontal_radius * horizontal_radius)
+    head_mask = in_y & in_radius
+    return np.nonzero(head_mask)[0].astype(np.int64)
 
 
 def _estimate_cross_section_radii(
@@ -229,6 +254,15 @@ def generate_body_smpl(
     }
 
     # ------------------------------------------------------------------
+    # Head face indices (for face texture in GLB)
+    # ------------------------------------------------------------------
+    head_joint_pos = joints_scaled[15]  # "head" joint
+    head_face_indices = _get_head_face_indices(
+        vertices, faces, neck_y, head_joint_pos,
+        y_margin_above=0.20,
+    )
+
+    # ------------------------------------------------------------------
     # Build mesh, colour, fix normals
     # ------------------------------------------------------------------
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
@@ -247,6 +281,7 @@ def generate_body_smpl(
         "weights": weights,
         "kintree_parents": kintree_parents,
         "joints_positions": joints_scaled,
+        "head_face_indices": head_face_indices,
     }
 
     return mesh, landmarks, skinning

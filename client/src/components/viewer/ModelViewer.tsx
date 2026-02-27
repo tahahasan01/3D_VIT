@@ -62,7 +62,7 @@ export function ModelViewer({ showOverlayControls = true }: ModelViewerProps) {
           near: 0.1,
           far: 100,
         }}
-        gl={{ preserveDrawingBuffer: true, antialias: true, stencil: true }}
+        gl={{ preserveDrawingBuffer: true, antialias: true, stencil: true, toneMapping: THREE.ACESFilmicToneMapping, toneMappingExposure: 1.0 }}
         shadows
       >
         <Lighting />

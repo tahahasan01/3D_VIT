@@ -24,7 +24,7 @@ export function TryOnScene() {
         {bodyModelUrl && <BodyModel url={bodyModelUrl} />}
 
         {visibleGarments.map((garment) => (
-          <GarmentModel key={garment.id} url={garment.modelUrl} />
+          <GarmentModel key={garment.id} url={garment.modelUrl} garmentType={garment.type} />
         ))}
       </Suspense>
     </group>

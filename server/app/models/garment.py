@@ -13,6 +13,10 @@ class GarmentType(str, Enum):
     """Supported garment template types."""
 
     TSHIRT = "tshirt"
+    POLO = "polo"
+    BUTTON_DOWN = "button_down"
+    HOODIE = "hoodie"
+    JACKET = "jacket"
     PANTS = "pants"
     DRESS = "dress"
 

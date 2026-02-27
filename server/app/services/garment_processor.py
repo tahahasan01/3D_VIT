@@ -38,9 +38,12 @@ from ..utils.mesh_helpers import (
     smooth_step,
     assign_cylindrical_uvs,
     assign_front_projection_uvs,
+    assign_pants_uvs,
+    assign_pants_uvs_simple,
 )
 from .texture_extractor import remove_background, prepare_texture
 from .silhouette_analyzer import analyze_tshirt_silhouette, get_width_at_height_frac
+from .pbr_maps import generate_normal_map, generate_roughness_map
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +65,21 @@ _GARMENT_OFFSET = 0.055  # ~5.5 cm when no body (mannequin / loose)
 _GARMENT_OFFSET_TIGHT = 0.022  # ~2.2 cm when body exists: shirt pastes on model
 _CONFORMING_OFFSET = 0.025  # ~2.5 cm for conforming garments (offset from body surface)
 
+# Upper-body types that use the tee/tshirt mesh pipeline (ISP or parametric)
+_UPPER_BODY_TYPES = frozenset({
+    GarmentType.TSHIRT, GarmentType.POLO, GarmentType.BUTTON_DOWN,
+    GarmentType.HOODIE, GarmentType.JACKET,
+})
+
+# Default sleeve_length_cm and length_cm per upper-body type (when user omits)
+_UPPER_BODY_DEFAULTS: dict[GarmentType, tuple[float, float]] = {
+    GarmentType.TSHIRT: (24.0, 72.0),
+    GarmentType.POLO: (18.0, 68.0),
+    GarmentType.BUTTON_DOWN: (62.0, 76.0),
+    GarmentType.HOODIE: (58.0, 72.0),
+    GarmentType.JACKET: (64.0, 78.0),
+}
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -74,6 +92,7 @@ def process_garment(
     body_measurements: dict | None = None,
     body_mesh: trimesh.Trimesh | None = None,
     height_m: float | None = None,
+    additional_images: list[bytes] | None = None,
 ) -> tuple[bytes, bool, np.ndarray | None]:
     """Process a 2D garment image into a 3D mesh.
 
@@ -82,6 +101,12 @@ def process_garment(
        sleeves, neckline, and panels.  Produces the best quality.
     2. Conforming offset surface from body mesh (fallback).
     3. Parametric template (last resort).
+
+    Parameters
+    ----------
+    additional_images : list[bytes] | None
+        Optional extra angle photos (back, side, detail).  Stored for future
+        multi-angle texture blending; currently logged only.
 
     Returns
     -------
@@ -93,6 +118,17 @@ def process_garment(
         image_bytes,
         garment_type=measurements.garment_type.value,
     )
+
+    back_clean_image: Image.Image | None = None
+    if additional_images and len(additional_images) > 0:
+        logger.info("Processing %d additional image(s) — using first as back view", len(additional_images))
+        try:
+            back_clean_image = remove_background(
+                additional_images[0],
+                garment_type=measurements.garment_type.value,
+            )
+        except Exception:
+            logger.warning("Failed to process back image, will use blurred front", exc_info=True)
     body_landmarks = body_landmarks or getattr(measurements, "body_landmarks", None)
     body_measurements = body_measurements or getattr(measurements, "body_measurements", None)
 
@@ -106,17 +142,30 @@ def process_garment(
     logger.info("Extracted garment color: %s", garment_rgb)
 
     # ── 1. ISP path (primary) ────────────────────────────────────────
-    if measurements.garment_type == GarmentType.TSHIRT and body_mesh is not None:
+    if measurements.garment_type in _UPPER_BODY_TYPES and body_mesh is not None:
+        sleeve_cm = measurements.sleeve_length_cm
+        length_cm_val = measurements.length_cm
+        if sleeve_cm is None or length_cm_val is None:
+            defaults = _UPPER_BODY_DEFAULTS.get(measurements.garment_type, (24.0, 72.0))
+            if sleeve_cm is None:
+                sleeve_cm = defaults[0]
+            if length_cm_val is None:
+                length_cm_val = defaults[1]
         isp_result = _try_isp_tshirt(
             body_mesh, garment_rgb, height_m,
-            sleeve_length_cm=measurements.sleeve_length_cm,
+            sleeve_length_cm=sleeve_cm,
             chest_cm=measurements.chest_cm,
-            length_cm=measurements.length_cm,
+            length_cm=length_cm_val,
         )
         if isp_result is not None:
             mesh, vertex_map = isp_result
+            seam_src = _apply_image_texture_to_mesh(
+                mesh, clean_image, garment_rgb, back_image=back_clean_image
+            )
+            if len(seam_src) > 0:
+                vertex_map = np.concatenate([vertex_map, vertex_map[seam_src]])
             glb = _export_textured_glb(mesh)
-            logger.info("ISP tshirt: %d verts, vertex_map %s", len(mesh.vertices), vertex_map.shape)
+            logger.info("ISP %s: %d verts, vertex_map %s", measurements.garment_type.value, len(mesh.vertices), vertex_map.shape)
             return glb, True, vertex_map
 
     if measurements.garment_type == GarmentType.PANTS and body_mesh is not None:
@@ -128,20 +177,27 @@ def process_garment(
         )
         if isp_result is not None:
             mesh, vertex_map = isp_result
+            seam_src = _apply_image_texture_to_mesh(mesh, clean_image, garment_rgb, is_pants=True, back_image=back_clean_image)
+            if len(seam_src) > 0:
+                vertex_map = np.concatenate([vertex_map, vertex_map[seam_src]])
             glb = _export_textured_glb(mesh)
             logger.info("ISP pants: %d verts, vertex_map %s", len(mesh.vertices), vertex_map.shape)
             return glb, True, vertex_map
 
     # ── 2. Conforming path (fallback when ISP unavailable) ────────────
     silhouette: dict | None = None
-    if measurements.garment_type == GarmentType.TSHIRT:
+    if measurements.garment_type in _UPPER_BODY_TYPES:
         silhouette = analyze_tshirt_silhouette(clean_image)
+
+    _pants_type = measurements.garment_type == GarmentType.PANTS
 
     if body_mesh is not None and body_landmarks:
         result = _build_conforming_garment(body_mesh, body_landmarks, measurements, silhouette)
         if result[0] is not None:
             mesh, vertex_map = result
-            _apply_color_to_mesh(mesh, garment_rgb, clean_image)
+            seam_src = _apply_color_to_mesh(mesh, garment_rgb, clean_image, is_pants=_pants_type, back_image=back_clean_image)
+            if len(seam_src) > 0 and vertex_map is not None:
+                vertex_map = np.concatenate([vertex_map, vertex_map[seam_src]])
             trimesh.repair.fix_normals(mesh)
             return _export_textured_glb(mesh), True, vertex_map
 
@@ -151,7 +207,7 @@ def process_garment(
         body_landmarks,
         silhouette=silhouette,
     )
-    _apply_color_to_mesh(mesh, garment_rgb, clean_image)
+    _seam = _apply_color_to_mesh(mesh, garment_rgb, clean_image, is_pants=_pants_type, back_image=back_clean_image)
     trimesh.repair.fix_normals(mesh)
     return _export_textured_glb(mesh), False, None
 
@@ -399,10 +455,37 @@ def _try_isp_tshirt(
                         faces=np.array(new_faces_list),
                         process=False,
                     )
-                    logger.info("Sealed %d boundary edges across %d loops",
-                                total_sealed, len(loops))
+                logger.info("Sealed %d boundary edges across %d loops",
+                            total_sealed, len(loops))
         except Exception as exc:
             logger.warning("Boundary sealing failed: %s", exc)
+
+        # ── 4b. Extend sleeves when ISP tee is shorter than desired ──
+        # ISP always generates a short-sleeve tee (~20–25 cm from torso
+        # centre). For long-sleeve garments (button-down, hoodie, jacket)
+        # we scale every arm vertex outward so the tip reaches the target
+        # extent. Only X is scaled; Y/Z are preserved so the sleeve tube
+        # shape stays intact.
+        if desired_sleeve > 0.28:
+            g_ext = np.asarray(garment_mesh.vertices, dtype=np.float64)
+            for _side in (-1, 1):
+                _side_arm = (
+                    (np.sign(g_ext[:, 0] - cx) == _side)
+                    & (np.abs(g_ext[:, 0] - cx) > SLEEVE_SHOULDER_X * 0.5)
+                )
+                if not _side_arm.any():
+                    continue
+                _cur_max = float(np.abs(g_ext[_side_arm, 0] - cx).max())
+                _target = max_x_from_center  # = SLEEVE_SHOULDER_X + desired_sleeve
+                if _target > _cur_max * 1.08:
+                    _sc = min(_target / max(_cur_max, 1e-6), 8.0)
+                    g_ext[_side_arm, 0] = cx + (g_ext[_side_arm, 0] - cx) * _sc
+                    logger.info(
+                        "Extended %s sleeve: %.1f → %.1f cm",
+                        "left" if _side < 0 else "right",
+                        _cur_max * 100, _target * 100,
+                    )
+            garment_mesh.vertices = g_ext
 
         # ── 5. Fill holes + fix winding ──────────────────────────────
         for _ in range(5):
@@ -585,11 +668,22 @@ def _try_isp_pants(
                         xz_scale, natural_hip, desired_hip)
 
         # ── 3. Length Y stretch (top-anchored) ───────────────────────
+        # Compute body dimensions first (needed for default length)
+        body_verts_np = np.asarray(body_mesh.vertices)
+        body_y_min = float(body_verts_np[:, 1].min())
+        body_y_max = float(body_verts_np[:, 1].max())
+        body_height_val = body_y_max - body_y_min
+        body_waist_y = body_y_min + body_height_val * 0.56
+        body_ankle_y = body_y_min + body_height_val * 0.06
+
         natural_top = float(garment_mesh.bounds[1][1])
         natural_bot = float(garment_mesh.bounds[0][1])
         natural_len = natural_top - natural_bot
-        desired_len = (length_cm / 100.0) if length_cm else natural_len
-        desired_len = float(np.clip(desired_len, natural_len * 0.5, natural_len * 1.5))
+        if length_cm:
+            desired_len = length_cm / 100.0
+        else:
+            desired_len = body_waist_y - body_ankle_y
+        desired_len = float(np.clip(desired_len, natural_len * 0.3, natural_len * 2.5))
         if abs(desired_len - natural_len) > 0.01:
             verts = garment_mesh.vertices
             t = np.clip((natural_top - verts[:, 1]) / max(natural_len, 0.01), 0.0, 1.0)
@@ -605,12 +699,6 @@ def _try_isp_pants(
         garment_mesh.vertices[:, 2] += body_center[2] - garment_center[2]
 
         # Align Y: shift so pants waistband sits at body waist level.
-        # Body waist ≈ 56% of body height (SMPL standard).
-        body_verts_np = np.asarray(body_mesh.vertices)
-        body_y_min = float(body_verts_np[:, 1].min())
-        body_y_max = float(body_verts_np[:, 1].max())
-        body_height_val = body_y_max - body_y_min
-        body_waist_y = body_y_min + body_height_val * 0.56   # natural waist
         pants_top_y = float(garment_mesh.bounds[1][1])
         y_shift = body_waist_y - pants_top_y
         garment_mesh.vertices[:, 1] += y_shift
@@ -822,17 +910,21 @@ def _try_isp_pants(
                 garment_verts + correction[:, np.newaxis] * nearest_nrm
             ).astype(np.float64)
 
-        # ── 6b. Keep only the largest connected component ────────────
-        # ISP can produce tiny disconnected fragments.
+        # ── 6b. Keep the two largest connected components ──────────
+        # ISP can produce tiny disconnected fragments, but pants
+        # legitimately have two legs that may separate at the crotch.
+        # Keep the two biggest (left + right leg) and discard noise.
         components = garment_mesh.split(only_watertight=False)
-        if len(components) > 1:
-            largest = max(components, key=lambda c: len(c.faces))
-            if len(largest.faces) > len(garment_mesh.faces) * 0.5:
+        if len(components) > 2:
+            components_sorted = sorted(components, key=lambda c: len(c.faces), reverse=True)
+            kept = components_sorted[:2]
+            kept_faces = sum(len(c.faces) for c in kept)
+            if kept_faces > len(garment_mesh.faces) * 0.4:
+                garment_mesh = trimesh.util.concatenate(kept)
                 logger.info(
-                    "Keeping largest component (%d faces) out of %d components",
-                    len(largest.faces), len(components),
+                    "Kept 2 largest components (%d faces) out of %d components",
+                    kept_faces, len(components),
                 )
-                garment_mesh = largest
             # Re-query vertex_map
             garment_verts = np.asarray(garment_mesh.vertices, dtype=np.float64)
             _, vertex_map = tree.query(garment_verts, k=1)
@@ -855,12 +947,30 @@ def _try_isp_pants(
             _, vertex_map = tree.query(garment_verts, k=1)
             vertex_map = vertex_map.astype(np.int64)
 
-        # ── 7. Level ragged hems ──────────────────────────────────
+        # ── 7. Seal interior boundary loops + fill holes ────────────
+        # fill_holes only handles small holes.  Large missing panels
+        # (side seam, inner thigh) need explicit boundary-loop bridging.
+        garment_mesh, n_sealed = _seal_interior_boundaries(garment_mesh)
+        if n_sealed > 0:
+            garment_verts = np.asarray(garment_mesh.vertices, dtype=np.float64)
+            _, vertex_map = tree.query(garment_verts, k=1)
+            vertex_map = vertex_map.astype(np.int64)
+            logger.info("Sealed %d interior boundary edges", n_sealed)
+
+        for _hf in range(5):
+            try:
+                trimesh.repair.fill_holes(garment_mesh)
+            except Exception:
+                break
+        trimesh.repair.fix_winding(garment_mesh)
+        trimesh.repair.fix_normals(garment_mesh)
+
+        # ── 7b. Level ragged hems ─────────────────────────────────
         _level_hem(garment_mesh, top=True, blend_cm=1.0)   # smooth waistband
         _level_hem(garment_mesh, top=False, blend_cm=2.0)  # smooth leg hems
 
         # ── 8. Apply colour ──────────────────────────────────────────
-        _apply_vertex_color(garment_mesh, garment_rgb)
+        _apply_vertex_color(garment_mesh, garment_rgb, is_pants=True)
 
         trimesh.repair.fix_normals(garment_mesh)
         logger.info(
@@ -972,25 +1082,196 @@ def _level_hem(mesh: trimesh.Trimesh, *, top: bool = False, blend_cm: float = 2.
 
 
 # ---------------------------------------------------------------------------
+# Interior boundary sealing (fills large missing panels)
+# ---------------------------------------------------------------------------
+
+def _seal_interior_boundaries(
+    mesh: trimesh.Trimesh,
+    margin_frac: float = 0.08,
+) -> tuple[trimesh.Trimesh, int]:
+    """Find boundary loops NOT at the top/bottom hems and seal them.
+
+    Large missing panels (side seam, inner thigh) show up as open
+    boundary loops in the interior of the mesh.  ``fill_holes`` can't
+    handle big gaps, so we fan-triangulate each interior loop from
+    its centroid.
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    margin_frac : float
+        Fraction of the mesh Y-range used to detect hem boundaries
+        (loops whose mean Y is within this margin of the top/bottom
+        are kept open — they are the waistband or leg hems).
+
+    Returns
+    -------
+    (mesh, n_sealed_edges)
+    """
+    from collections import defaultdict
+
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    faces = np.asarray(mesh.faces, dtype=np.int32)
+
+    y_min, y_max = float(verts[:, 1].min()), float(verts[:, 1].max())
+    y_range = y_max - y_min
+    if y_range < 0.01:
+        return mesh, 0
+
+    top_thresh = y_max - y_range * margin_frac
+    bot_thresh = y_min + y_range * margin_frac
+
+    # Find boundary edges
+    edge_count: dict[tuple[int, int], int] = defaultdict(int)
+    for f in faces:
+        for i in range(3):
+            e = tuple(sorted((int(f[i]), int(f[(i + 1) % 3]))))
+            edge_count[e] += 1
+
+    boundary_edges = [e for e, c in edge_count.items() if c == 1]
+    if not boundary_edges:
+        return mesh, 0
+
+    # Build adjacency for boundary verts
+    adj: dict[int, set[int]] = defaultdict(set)
+    for a, b in boundary_edges:
+        adj[a].add(b)
+        adj[b].add(a)
+
+    # Trace loops
+    visited: set[int] = set()
+    loops: list[list[int]] = []
+    for start in adj:
+        if start in visited:
+            continue
+        loop = [start]
+        visited.add(start)
+        cur = start
+        while True:
+            nbs = adj[cur] - visited
+            if not nbs:
+                break
+            nxt = min(nbs)
+            loop.append(nxt)
+            visited.add(nxt)
+            cur = nxt
+        if len(loop) >= 3:
+            loops.append(loop)
+
+    # Filter out hem/waist loops (keep only interior ones)
+    interior_loops: list[list[int]] = []
+    for loop in loops:
+        mean_y = float(np.mean([verts[vi, 1] for vi in loop]))
+        if bot_thresh < mean_y < top_thresh:
+            interior_loops.append(loop)
+
+    if not interior_loops:
+        return mesh, 0
+
+    # Fan-triangulate each interior loop from its centroid
+    new_verts = list(verts)
+    new_faces = list(faces)
+    total_sealed = 0
+
+    for loop in interior_loops:
+        loop_positions = np.array([verts[vi] for vi in loop])
+        centroid = loop_positions.mean(axis=0)
+        cent_idx = len(new_verts)
+        new_verts.append(centroid)
+        for j in range(len(loop)):
+            v0 = loop[j]
+            v1 = loop[(j + 1) % len(loop)]
+            new_faces.append([v0, v1, cent_idx])
+        total_sealed += len(loop)
+
+    if total_sealed == 0:
+        return mesh, 0
+
+    sealed = trimesh.Trimesh(
+        vertices=np.array(new_verts, dtype=np.float64),
+        faces=np.array(new_faces, dtype=np.int32),
+        process=False,
+    )
+    return sealed, total_sealed
+
+
+# ---------------------------------------------------------------------------
 # Shared vertex color helper
 # ---------------------------------------------------------------------------
 
 def _apply_vertex_color(
     mesh: trimesh.Trimesh,
     garment_rgb: tuple[int, int, int] | None,
+    is_pants: bool = False,
 ) -> None:
-    """Apply a solid vertex colour to an ISP mesh."""
-    n = len(mesh.vertices)
-    if garment_rgb is not None:
-        rgba = np.zeros((n, 4), dtype=np.uint8)
-        rgba[:, 0] = garment_rgb[0]
-        rgba[:, 1] = garment_rgb[1]
-        rgba[:, 2] = garment_rgb[2]
-        rgba[:, 3] = 255
-    else:
-        rgba = np.full((n, 4), 180, dtype=np.uint8)
-        rgba[:, 3] = 255
-    mesh.visual = trimesh.visual.ColorVisuals(vertex_colors=rgba)
+    """Apply a solid colour as a texture with UVs so frontend fabric PBR maps can tile.
+
+    Uses TextureVisuals with a tiny solid-color image instead of ColorVisuals,
+    so the exported GLB always has UV coordinates for normal/roughness maps.
+    For solid colours the front/back distinction is irrelevant, so pants use
+    a simple XY projection that does NOT duplicate vertices.
+    """
+    r, g, b = garment_rgb if garment_rgb is not None else (180, 180, 180)
+    uvs = assign_pants_uvs_simple(mesh) if is_pants else assign_cylindrical_uvs(mesh)
+    tex_img = Image.new("RGB", (4, 4), (r, g, b))
+    mesh.visual = trimesh.visual.TextureVisuals(uv=uvs, image=tex_img)
+
+
+def _apply_image_texture_to_mesh(
+    mesh: trimesh.Trimesh,
+    clean_image,
+    garment_rgb: tuple[int, int, int] | None,
+    is_pants: bool = False,
+    back_image: Image.Image | None = None,
+) -> np.ndarray:
+    """Apply the garment photo as a UV-projected texture.
+
+    Falls back to vertex color when the image is unusable.
+
+    Returns
+    -------
+    seam_source_indices : ndarray
+        Original vertex indices for duplicated seam vertices (pants only).
+        Empty array if no duplication occurred.  The caller must use this
+        to extend ``vertex_map`` for skinning.
+    """
+    empty_seam = np.array([], dtype=np.int64)
+    img = (
+        clean_image if isinstance(clean_image, Image.Image)
+        else Image.open(io.BytesIO(clean_image)).convert("RGBA")
+    )
+    # Use a dual-half texture atlas (front left / back right) whenever a
+    # back image is available — including for shirts and other upper-body
+    # garments.  Without a back image, shirts fall back to cylindrical UVs.
+    use_split = is_pants or back_image is not None
+    tex_img = prepare_texture(
+        img, target_size=(1024, 1024), avoid_white_fill=True,
+        frontal=use_split, back_image=back_image if use_split else None,
+    )
+
+    if tex_img is None:
+        _apply_vertex_color(mesh, garment_rgb, is_pants=is_pants)
+        return empty_seam
+
+    try:
+        seam_sources = empty_seam
+        if use_split:
+            uvs, seam_sources = assign_pants_uvs(mesh)
+        else:
+            uvs = assign_cylindrical_uvs(mesh)
+        if tex_img.mode == "RGBA":
+            tex_img = tex_img.convert("RGB")
+        if not isinstance(tex_img, Image.Image):
+            tex_img = Image.fromarray(np.asarray(tex_img, dtype=np.uint8))
+        mesh.visual = trimesh.visual.TextureVisuals(uv=uvs, image=tex_img)
+        logger.info("Applied image texture (%dx%d) to %s mesh (%d seam verts duplicated)",
+                     tex_img.size[0], tex_img.size[1],
+                     "pants" if is_pants else "upper-body", len(seam_sources))
+        return seam_sources
+    except Exception:
+        logger.debug("Image texture failed, falling back to vertex colour", exc_info=True)
+        _apply_vertex_color(mesh, garment_rgb, is_pants=is_pants)
+        return empty_seam
 
 
 # ---------------------------------------------------------------------------
@@ -1063,28 +1344,53 @@ def _center_pixel_color(image_bytes: bytes) -> tuple[int, int, int] | None:
 def _apply_color_to_mesh(
     mesh: trimesh.Trimesh,
     garment_rgb: tuple[int, int, int] | None,
-    clean_image: bytes,
-) -> None:
-    """Apply garment colour as vertex colors, or fall back to texture."""
-    if garment_rgb is not None:
-        n = len(mesh.vertices)
-        rgba = np.zeros((n, 4), dtype=np.uint8)
-        rgba[:, 0] = garment_rgb[0]
-        rgba[:, 1] = garment_rgb[1]
-        rgba[:, 2] = garment_rgb[2]
-        rgba[:, 3] = 255
-        mesh.visual = trimesh.visual.ColorVisuals(vertex_colors=rgba)
-    else:
-        # Fall back to old texture pipeline
-        try:
-            uvs = assign_front_projection_uvs(mesh)
-            texture_image = prepare_texture(clean_image, target_size=(1024, 1024), avoid_white_fill=True)
-            if texture_image.mode == "RGBA":
-                texture_image = texture_image.convert("RGB")
-            tex_arr = np.array(texture_image, dtype=np.uint8)
-            mesh.visual = trimesh.visual.TextureVisuals(uv=uvs, image=tex_arr)
-        except Exception:
-            pass  # leave visual as-is
+    clean_image: bytes | Image.Image,
+    is_pants: bool = False,
+    back_image: Image.Image | None = None,
+) -> np.ndarray:
+    """Apply the uploaded garment image as texture so color and pattern show.
+
+    Always tries image-as-texture first so patterns (ribbing, denim fade, etc.)
+    are visible. Falls back to solid colour with UVs only when texture prep
+    or application fails.
+
+    Returns
+    -------
+    seam_source_indices : ndarray
+        Original vertex indices for duplicated seam vertices (pants only).
+    """
+    empty_seam = np.array([], dtype=np.int64)
+    img_for_texture = (
+        clean_image if isinstance(clean_image, Image.Image)
+        else Image.open(io.BytesIO(clean_image)).convert("RGBA")
+    )
+    try:
+        use_split = is_pants or back_image is not None
+        texture_image = prepare_texture(
+            img_for_texture,
+            target_size=(1024, 1024),
+            avoid_white_fill=True,
+            frontal=use_split,
+            back_image=back_image if use_split else None,
+        )
+        seam_sources = empty_seam
+        if use_split:
+            uvs, seam_sources = assign_pants_uvs(mesh)
+        else:
+            uvs = assign_cylindrical_uvs(mesh)
+        if texture_image.mode == "RGBA":
+            texture_image = texture_image.convert("RGB")
+        if not isinstance(texture_image, Image.Image):
+            texture_image = Image.fromarray(np.asarray(texture_image, dtype=np.uint8))
+        mesh.visual = trimesh.visual.TextureVisuals(uv=uvs, image=texture_image)
+        logger.info("Applied image texture (%dx%d) to %s mesh (%d seam verts duplicated)",
+                     texture_image.size[0], texture_image.size[1],
+                     "pants" if is_pants else "upper-body", len(seam_sources))
+        return seam_sources
+    except Exception:
+        logger.debug("Image texture failed, using solid colour", exc_info=True)
+        _apply_vertex_color(mesh, garment_rgb, is_pants=is_pants)
+        return empty_seam
 
 
 # ---------------------------------------------------------------------------
@@ -1117,12 +1423,25 @@ def _dominant_color_from_texture(rgb_array: np.ndarray) -> tuple[int, int, int] 
 
 def _export_textured_glb(mesh: trimesh.Trimesh) -> bytes:
     """Export a single mesh with TextureVisuals to GLB so the texture is embedded."""
+    vis = mesh.visual
+    has_texture = (
+        isinstance(vis, trimesh.visual.TextureVisuals)
+        and hasattr(vis, "material")
+        and vis.material is not None
+        and isinstance(getattr(vis.material, "image", None), Image.Image)
+    )
+    logger.info(
+        "Exporting GLB: visual=%s has_texture=%s",
+        type(vis).__name__, has_texture,
+    )
     try:
-        return mesh.export(file_type="glb")
+        glb = mesh.export(file_type="glb")
     except Exception:
         logger.debug("Direct mesh GLB export failed, using Scene", exc_info=True)
         scene = trimesh.Scene(mesh)
-        return scene.export(file_type="glb")
+        glb = scene.export(file_type="glb")
+    logger.info("GLB export: %d bytes", len(glb))
+    return glb
 
 
 # ---------------------------------------------------------------------------
@@ -1137,15 +1456,149 @@ def _create_garment_template(
     """Route to the correct parametric template builder."""
     builders = {
         GarmentType.TSHIRT: _build_tshirt,
+        GarmentType.POLO: _build_tshirt,
+        GarmentType.BUTTON_DOWN: _build_tshirt,
+        GarmentType.HOODIE: _build_tshirt,
+        GarmentType.JACKET: _build_tshirt,
         GarmentType.PANTS: _build_pants,
         GarmentType.DRESS: _build_dress,
     }
     builder = builders.get(m.garment_type)
     if builder is None:
         raise ValueError(f"Unsupported garment type: {m.garment_type}")
-    if m.garment_type == GarmentType.TSHIRT:
+    if m.garment_type in _UPPER_BODY_TYPES:
         return _build_tshirt(m, body_landmarks, silhouette=silhouette)
     return builder(m, body_landmarks)
+
+
+# ---------------------------------------------------------------------------
+# Polo collar geometry
+# ---------------------------------------------------------------------------
+
+def _add_polo_collar(
+    garment_mesh: trimesh.Trimesh,
+    body_mesh: trimesh.Trimesh,
+    selected_vertex_indices: np.ndarray,
+    collar_height: float = 0.03,
+    collar_tilt: float = 0.012,
+    notch_half_angle: float = np.radians(30),
+) -> tuple[trimesh.Trimesh, np.ndarray]:
+    """Add a folded polo collar band around the neckline of *garment_mesh*.
+
+    Parameters
+    ----------
+    garment_mesh : trimesh.Trimesh
+        The base shirt mesh (vertices already offset from body).
+    body_mesh : trimesh.Trimesh
+        The original body mesh, used for nearest-vertex mapping.
+    selected_vertex_indices : np.ndarray
+        Body-vertex indices for each garment vertex (length == garment_mesh
+        vertex count).  Collar vertices will be appended with the nearest
+        neckline body vertex.
+    collar_height : float
+        Height of the collar band in metres (default 3 cm).
+    collar_tilt : float
+        Outward offset added to the collar top to give it a slight flare.
+    notch_half_angle : float
+        Half-angle (radians) of the V-notch opening at the front (+Z).
+
+    Returns
+    -------
+    (combined_mesh, updated_vertex_indices)
+    """
+    g_verts = np.asarray(garment_mesh.vertices, dtype=np.float64)
+    g_faces = np.asarray(garment_mesh.faces, dtype=np.int32)
+
+    # --- Detect neckline: boundary edges whose vertices are near the top ---
+    edges = garment_mesh.edges_unique
+    edge_face_count = np.zeros(len(edges), dtype=int)
+    edge_to_idx = {tuple(sorted(e)): i for i, e in enumerate(edges)}
+    for f in g_faces:
+        for pair in [(f[0], f[1]), (f[1], f[2]), (f[2], f[0])]:
+            key = tuple(sorted(pair))
+            idx = edge_to_idx.get(key)
+            if idx is not None:
+                edge_face_count[idx] += 1
+    boundary_edges = edges[edge_face_count == 1]
+
+    boundary_verts = np.unique(boundary_edges.ravel())
+    if len(boundary_verts) == 0:
+        return garment_mesh, selected_vertex_indices
+
+    y_coords = g_verts[boundary_verts, 1]
+    y_top_threshold = y_coords.max() - 0.4 * (y_coords.max() - y_coords.min())
+    neckline_mask = y_coords >= y_top_threshold
+    neckline_verts = boundary_verts[neckline_mask]
+
+    if len(neckline_verts) < 3:
+        return garment_mesh, selected_vertex_indices
+
+    # --- Order neckline vertices by angle around the Y axis ---
+    neck_positions = g_verts[neckline_verts]
+    cx, cz = neck_positions[:, 0].mean(), neck_positions[:, 2].mean()
+    angles = np.arctan2(neck_positions[:, 0] - cx, neck_positions[:, 2] - cz)
+    order = np.argsort(angles)
+    neckline_verts = neckline_verts[order]
+    neck_positions = neck_positions[order]
+    angles = angles[order]
+
+    # --- Compute per-vertex outward direction (XZ plane) ---
+    radial = np.zeros_like(neck_positions)
+    radial[:, 0] = neck_positions[:, 0] - cx
+    radial[:, 2] = neck_positions[:, 2] - cz
+    radial_len = np.linalg.norm(radial, axis=1, keepdims=True).clip(min=1e-8)
+    radial /= radial_len
+
+    # --- Build upper ring ---
+    upper_positions = neck_positions.copy()
+    upper_positions[:, 1] += collar_height
+    upper_positions += radial * collar_tilt
+
+    n_ring = len(neckline_verts)
+    n_existing = len(g_verts)
+
+    # --- V-notch mask: exclude faces whose *both* vertices fall inside the notch ---
+    front_angle = 0.0  # front is +Z → atan2(x-cx, z-cz) ≈ 0
+    angle_from_front = np.abs(np.arctan2(np.sin(angles - front_angle),
+                                          np.cos(angles - front_angle)))
+    in_notch = angle_from_front < notch_half_angle
+
+    # --- Build collar faces (quad strip → two tris per segment) ---
+    collar_faces = []
+    for i in range(n_ring):
+        j = (i + 1) % n_ring
+        if in_notch[i] and in_notch[j]:
+            continue
+
+        lo_i = int(neckline_verts[i])
+        lo_j = int(neckline_verts[j])
+        hi_i = n_existing + i
+        hi_j = n_existing + j
+        collar_faces.append([lo_i, lo_j, hi_j])
+        collar_faces.append([lo_i, hi_j, hi_i])
+
+    if len(collar_faces) == 0:
+        return garment_mesh, selected_vertex_indices
+
+    collar_faces = np.array(collar_faces, dtype=np.int32)
+
+    # --- Combine meshes ---
+    combined_verts = np.vstack([g_verts, upper_positions])
+    combined_faces = np.vstack([g_faces, collar_faces])
+
+    combined_mesh = trimesh.Trimesh(vertices=combined_verts, faces=combined_faces,
+                                    process=False)
+
+    # --- Update vertex map: collar vertices → nearest neckline body vertex ---
+    body_verts = np.asarray(body_mesh.vertices, dtype=np.float64)
+    neckline_body_indices = selected_vertex_indices[neckline_verts]
+    neckline_body_positions = body_verts[neckline_body_indices]
+    tree = cKDTree(neckline_body_positions)
+    _, nn_idx = tree.query(upper_positions)
+    collar_body_indices = neckline_body_indices[nn_idx]
+    updated_indices = np.concatenate([selected_vertex_indices, collar_body_indices])
+
+    return combined_mesh, updated_indices
 
 
 # ---------------------------------------------------------------------------
@@ -1164,6 +1617,17 @@ def _build_conforming_garment(
     """
     if m.garment_type == GarmentType.TSHIRT:
         return _build_conforming_tshirt(body_mesh, landmarks, m, silhouette)
+    elif m.garment_type == GarmentType.POLO:
+        result = _build_conforming_tshirt(body_mesh, landmarks, m, silhouette, offset_scale=1.0)
+        if result[0] is not None:
+            return _add_polo_collar(result[0], body_mesh, result[1])
+        return result
+    elif m.garment_type == GarmentType.BUTTON_DOWN:
+        return _build_conforming_tshirt(body_mesh, landmarks, m, silhouette, offset_scale=1.0)
+    elif m.garment_type == GarmentType.HOODIE:
+        return _build_conforming_tshirt(body_mesh, landmarks, m, silhouette, offset_scale=1.2)
+    elif m.garment_type == GarmentType.JACKET:
+        return _build_conforming_tshirt(body_mesh, landmarks, m, silhouette, offset_scale=1.3)
     elif m.garment_type == GarmentType.PANTS:
         return _build_conforming_pants(body_mesh, landmarks, m)
     elif m.garment_type == GarmentType.DRESS:
@@ -1180,10 +1644,12 @@ def _build_conforming_tshirt(
     landmarks: dict,
     m: GarmentMeasurements,
     silhouette: dict | None = None,
+    offset_scale: float = 1.0,
 ) -> tuple[trimesh.Trimesh, np.ndarray] | tuple[None, None]:
-    """Build a T-shirt as an offset surface from the body mesh.
+    """Build a T-shirt (or polo, button-down, hoodie, jacket) as an offset surface from the body mesh.
     Respects sleeve_length_cm (and silhouette if provided) so the result is
     half-sleeve when the user enters a short sleeve length.
+    offset_scale: 1.2 for hoodie, 1.3 for jacket, 1.0 otherwise.
 
     Returns (mesh, selected_vertex_indices) or (None, None) on failure.
     """
@@ -1237,7 +1703,7 @@ def _build_conforming_tshirt(
     if normals.shape[0] != verts.shape[0]:
         return None, None
     garment_normals = normals[selected_vertex_indices]
-    garment_vertices = garment_vertices + _CONFORMING_OFFSET * garment_normals
+    garment_vertices = garment_vertices + (_CONFORMING_OFFSET * offset_scale) * garment_normals
 
     out = trimesh.Trimesh(vertices=garment_vertices, faces=new_faces)
     return out, selected_vertex_indices
@@ -1449,9 +1915,17 @@ def _build_tshirt(
     body_landmarks: dict | None = None,
     silhouette: dict | None = None,
 ) -> trimesh.Trimesh:
-    """Build a T-shirt: torso + sleeves. When body_landmarks exist, shirt pastes on model (tight fit)."""
-    length = (m.length_cm or 72.0) / 100.0
-    sleeve_len = (m.sleeve_length_cm or 25.0) / 100.0
+    """Build a T-shirt (or polo, button-down, hoodie, jacket): torso + sleeves. When body_landmarks exist, shirt pastes on model (tight fit)."""
+    sleeve_cm = m.sleeve_length_cm
+    length_cm_val = m.length_cm
+    if sleeve_cm is None or length_cm_val is None:
+        defaults = _UPPER_BODY_DEFAULTS.get(m.garment_type, (25.0, 72.0))
+        if sleeve_cm is None:
+            sleeve_cm = defaults[0]
+        if length_cm_val is None:
+            length_cm_val = defaults[1]
+    length = length_cm_val / 100.0
+    sleeve_len = sleeve_cm / 100.0
     offset = _GARMENT_OFFSET_TIGHT if body_landmarks else _GARMENT_OFFSET
 
     if body_landmarks:

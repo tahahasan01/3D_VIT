@@ -7,7 +7,7 @@
 
 import { useCallback, useMemo, useState } from "react";
 import { useDropzone } from "react-dropzone";
-import { Upload, Shirt } from "lucide-react";
+import { Upload, Shirt, ImagePlus, X } from "lucide-react";
 import { Button } from "../ui/Button";
 import { Input } from "../ui/Input";
 import { Select } from "../ui/Select";
@@ -26,11 +26,12 @@ import { ACCEPTED_IMAGE_TYPES, MAX_UPLOAD_SIZE_MB } from "../../utils/constants"
 interface GarmentUploadProps {
   /** Whether the backend is currently processing. */
   isLoading: boolean;
-  /** Called with the selected file and measurements on submit. */
+  /** Called with the selected file, measurements, and optional additional angle images on submit. */
   onSubmit: (
     image: File,
     measurements: GarmentMeasurements,
     options?: GarmentSubmitOptions,
+    additionalImages?: File[],
   ) => void;
 }
 
@@ -38,16 +39,28 @@ const GARMENT_TYPE_OPTIONS = Object.entries(GARMENT_TYPE_LABELS).map(
   ([value, label]) => ({ value, label }),
 );
 
+/** Upper-body field set (shared by tshirt, polo, button_down, hoodie, jacket). */
+const UPPER_BODY_FIELDS: {
+  key: keyof GarmentMeasurements;
+  label: string;
+  min: number;
+  max: number;
+}[] = [
+  { key: "chest_cm", label: "Chest", min: 60, max: 160 },
+  { key: "length_cm", label: "Length", min: 40, max: 100 },
+  { key: "sleeve_length_cm", label: "Sleeve Length", min: 10, max: 90 },
+];
+
 /** Field definitions per garment type. */
 const FIELDS_BY_TYPE: Record<
   GarmentType,
   { key: keyof GarmentMeasurements; label: string; min: number; max: number }[]
 > = {
-  tshirt: [
-    { key: "chest_cm", label: "Chest", min: 60, max: 160 },
-    { key: "length_cm", label: "Length", min: 40, max: 100 },
-    { key: "sleeve_length_cm", label: "Sleeve Length", min: 10, max: 90 },
-  ],
+  tshirt: UPPER_BODY_FIELDS,
+  polo: UPPER_BODY_FIELDS,
+  button_down: UPPER_BODY_FIELDS,
+  hoodie: UPPER_BODY_FIELDS,
+  jacket: UPPER_BODY_FIELDS,
   pants: [
     { key: "waist_cm", label: "Waist", min: 50, max: 150 },
     { key: "hip_cm", label: "Hip", min: 60, max: 160 },
@@ -65,11 +78,13 @@ const FIELDS_BY_TYPE: Record<
 export function GarmentUpload({ isLoading, onSubmit }: GarmentUploadProps) {
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
+  const [additionalFiles, setAdditionalFiles] = useState<File[]>([]);
+  const [additionalPreviews, setAdditionalPreviews] = useState<string[]>([]);
   const [measurements, setMeasurements] = useState<GarmentMeasurements>(
     DEFAULT_GARMENT_MEASUREMENTS.tshirt,
   );
 
-  // ---- Dropzone setup -------------------------------------------------------
+  // ---- Primary dropzone setup ------------------------------------------------
   const onDrop = useCallback((accepted: File[]) => {
     const first = accepted[0];
     if (!first) return;
@@ -83,6 +98,34 @@ export function GarmentUpload({ isLoading, onSubmit }: GarmentUploadProps) {
     maxSize: MAX_UPLOAD_SIZE_MB * 1024 * 1024,
     multiple: false,
   });
+
+  // ---- Additional angles dropzone setup --------------------------------------
+  const onDropAdditional = useCallback((accepted: File[]) => {
+    setAdditionalFiles((prev) => [...prev, ...accepted]);
+    setAdditionalPreviews((prev) => [
+      ...prev,
+      ...accepted.map((f) => URL.createObjectURL(f)),
+    ]);
+  }, []);
+
+  const {
+    getRootProps: getAdditionalRootProps,
+    getInputProps: getAdditionalInputProps,
+    isDragActive: isAdditionalDragActive,
+  } = useDropzone({
+    onDrop: onDropAdditional,
+    accept: ACCEPTED_IMAGE_TYPES,
+    maxSize: MAX_UPLOAD_SIZE_MB * 1024 * 1024,
+    multiple: true,
+  });
+
+  const removeAdditionalImage = useCallback((index: number) => {
+    setAdditionalFiles((prev) => prev.filter((_, i) => i !== index));
+    setAdditionalPreviews((prev) => {
+      URL.revokeObjectURL(prev[index]);
+      return prev.filter((_, i) => i !== index);
+    });
+  }, []);
 
   // ---- Handlers -------------------------------------------------------------
   const handleTypeChange = useCallback(
@@ -108,9 +151,14 @@ export function GarmentUpload({ isLoading, onSubmit }: GarmentUploadProps) {
     (e: React.FormEvent) => {
       e.preventDefault();
       if (!file) return;
-      onSubmit(file, measurements);
+      onSubmit(
+        file,
+        measurements,
+        undefined,
+        additionalFiles.length > 0 ? additionalFiles : undefined,
+      );
     },
-    [file, measurements, onSubmit],
+    [file, measurements, additionalFiles, onSubmit],
   );
 
   const fields = useMemo(
@@ -156,6 +204,53 @@ export function GarmentUpload({ isLoading, onSubmit }: GarmentUploadProps) {
         <p className="text-xs text-gray-500">
           Use a flat photo of the garment. We&apos;ll build a 3D template from your measurements and apply this image as the texture. Complete step 1 first so the garment fits your 3D body.
         </p>
+
+        {/* Additional angle images */}
+        <div className="flex flex-col gap-2">
+          <p className="text-xs font-medium text-gray-500">
+            Add more angles (optional)
+          </p>
+
+          {additionalPreviews.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {additionalPreviews.map((src, i) => (
+                <div key={src} className="relative group">
+                  <img
+                    src={src}
+                    alt={`Angle ${i + 1}`}
+                    className="h-16 w-16 rounded border border-gray-200 object-cover"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => removeAdditionalImage(i)}
+                    className="absolute -right-1.5 -top-1.5 hidden rounded-full bg-gray-700 p-0.5 text-white group-hover:block"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div
+            {...getAdditionalRootProps()}
+            className={[
+              "flex items-center justify-center gap-2 rounded-md border border-dashed p-3 cursor-pointer",
+              "transition-colors duration-150 text-xs",
+              isAdditionalDragActive
+                ? "border-brand-400 bg-brand-50"
+                : "border-gray-200 hover:border-gray-300 bg-gray-50/50",
+            ].join(" ")}
+          >
+            <input {...getAdditionalInputProps()} />
+            <ImagePlus className="h-4 w-4 text-gray-400" />
+            <span className="text-gray-400">
+              {isAdditionalDragActive
+                ? "Drop images here"
+                : "Back, side, or detail shots"}
+            </span>
+          </div>
+        </div>
 
         {/* Garment type selector */}
         <Select

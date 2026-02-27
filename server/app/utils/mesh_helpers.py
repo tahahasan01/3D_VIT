@@ -275,6 +275,11 @@ def assign_cylindrical_uvs(mesh: trimesh.Trimesh, axis: int = 1) -> np.ndarray:
     For axis=1 (Y-up), the front-facing band (vertices facing +Z, camera view) is
     mapped to U in [0.25, 0.75] so the center of the texture (main garment view)
     appears on the front with less stretch; sides/back use the remaining U range.
+
+    Uses arctan2(z, -x) so the U direction matches camera-view left-to-right:
+    camera-left → low U, camera-right → high U.  Without the -x negate the
+    image would appear mirrored on the front of the mesh.
+
     Returns UV array of shape (n_vertices, 2) for use with TextureVisuals.
     """
     verts = mesh.vertices
@@ -283,7 +288,7 @@ def assign_cylindrical_uvs(mesh: trimesh.Trimesh, axis: int = 1) -> np.ndarray:
 
     if axis == 1:  # Y up: front (+Z) band -> U [0.25, 0.75]
         x, y, z = verts[:, 0], verts[:, 1], verts[:, 2]
-        angle = np.arctan2(z, x)  # in [-pi, pi]; +Z is pi/2
+        angle = np.arctan2(z, -x)  # negate x so U goes left-to-right in camera view
         front_lo, front_hi = np.pi / 4.0, 3.0 * np.pi / 4.0
         u = np.empty(n, dtype=np.float64)
         front_mask = (angle >= front_lo) & (angle <= front_hi)
@@ -294,7 +299,8 @@ def assign_cylindrical_uvs(mesh: trimesh.Trimesh, axis: int = 1) -> np.ndarray:
         u[right_mask] = 0.75 + 0.25 * (angle[right_mask] - front_hi) / (np.pi - front_hi)
         uvs[:, 0] = u
         y_min, y_max = y.min(), y.max()
-        uvs[:, 1] = (y - y_min) / max(y_max - y_min, 1e-6)
+        # glTF V=0 is image TOP, so invert: mesh top (collar) → V=0 → image top
+        uvs[:, 1] = 1.0 - (y - y_min) / max(y_max - y_min, 1e-6)
     elif axis == 0:
         y, z = verts[:, 1], verts[:, 2]
         uvs[:, 0] = (np.arctan2(z, y) / (2.0 * np.pi)) + 0.5
@@ -306,7 +312,149 @@ def assign_cylindrical_uvs(mesh: trimesh.Trimesh, axis: int = 1) -> np.ndarray:
         z_min, z_max = verts[:, 2].min(), verts[:, 2].max()
         uvs[:, 1] = (verts[:, 2] - z_min) / max(z_max - z_min, 1e-6)
 
-    return np.clip(uvs, 0.0, 1.0)
+    uvs = np.clip(uvs, 0.0, 1.0)
+
+    # Laplacian smooth UVs along mesh edges to reduce distortion at
+    # arm-torso junctions where the cylindrical projection creates
+    # sharp UV transitions between neighboring vertices.
+    try:
+        edges = mesh.edges_unique
+        if len(edges) > 0:
+            for _ in range(3):
+                new_uvs = uvs.copy()
+                # Build per-vertex neighbor sum and count
+                neighbor_sum = np.zeros_like(uvs)
+                neighbor_count = np.zeros(n, dtype=np.float64)
+                for e0, e1 in edges:
+                    neighbor_sum[e0] += uvs[e1]
+                    neighbor_sum[e1] += uvs[e0]
+                    neighbor_count[e0] += 1
+                    neighbor_count[e1] += 1
+                has_neighbors = neighbor_count > 0
+                avg = neighbor_sum[has_neighbors] / neighbor_count[has_neighbors, np.newaxis]
+                # Blend 20% toward neighbor average (gentle smoothing)
+                new_uvs[has_neighbors] = 0.8 * uvs[has_neighbors] + 0.2 * avg
+                uvs = np.clip(new_uvs, 0.0, 1.0)
+    except Exception:
+        pass  # non-critical; use unsmoothed UVs
+
+    return uvs
+
+
+def assign_pants_uvs_simple(mesh: trimesh.Trimesh) -> np.ndarray:
+    """Simple XY projection UVs for pants (no vertex duplication).
+
+    Used for solid-colour textures where front/back distinction is
+    irrelevant.  Does NOT modify the mesh.
+
+    Returns UV array of shape (n_vertices, 2).
+    """
+    verts = mesh.vertices
+    x, y = verts[:, 0], verts[:, 1]
+    x_min, x_max = float(x.min()), float(x.max())
+    y_min, y_max = float(y.min()), float(y.max())
+    u = (x - x_min) / max(x_max - x_min, 1e-6)
+    v = 1.0 - (y - y_min) / max(y_max - y_min, 1e-6)
+    return np.clip(np.column_stack([u, v]), 0.0, 1.0)
+
+
+def assign_pants_uvs(mesh: trimesh.Trimesh) -> tuple[np.ndarray, np.ndarray]:
+    """UV mapping for bifurcated garments with proper front/back UV seam.
+
+    Creates a **dual-half texture atlas**:
+
+    * Front-facing faces (centroid Z ≥ median) → left half  (U 0.0–0.5)
+    * Back-facing  faces (centroid Z <  median) → right half (U 0.5–1.0)
+
+    Within each half, U is a linear XY projection so the garment photo
+    maps naturally onto both legs without cylindrical distortion.
+
+    Vertices shared by front and back faces are **duplicated** to create
+    a clean UV seam (the standard technique for UV discontinuities).
+    This prevents the GPU from stretching the texture across the entire
+    atlas for faces that straddle the boundary.
+
+    **Modifies the mesh in-place** (adds duplicate vertices, updates
+    face indices).
+
+    Returns
+    -------
+    uvs : ndarray of shape (n_new_vertices, 2)
+    seam_source_indices : ndarray of original vertex indices for each
+        duplicated vertex.  Empty array if no duplication occurred.
+        The caller must use this to extend any per-vertex mappings
+        (e.g. ``vertex_map`` for skinning).
+    """
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    n_orig = len(verts)
+
+    x, y, z = verts[:, 0], verts[:, 1], verts[:, 2]
+
+    x_min, x_max = float(x.min()), float(x.max())
+    u_base = (x - x_min) / max(x_max - x_min, 1e-6)
+
+    y_min, y_max = float(y.min()), float(y.max())
+    v_coord = 1.0 - (y - y_min) / max(y_max - y_min, 1e-6)
+
+    z_med = float(np.median(z))
+
+    # ── Classify every face as front or back ──────────────────────────
+    face_cz = z[faces].mean(axis=1)
+    face_is_front = face_cz >= z_med
+
+    # ── Find seam vertices (shared by both front and back faces) ──────
+    vert_in_front = np.zeros(n_orig, dtype=bool)
+    vert_in_back = np.zeros(n_orig, dtype=bool)
+    if face_is_front.any():
+        vert_in_front[np.unique(faces[face_is_front])] = True
+    if (~face_is_front).any():
+        vert_in_back[np.unique(faces[~face_is_front])] = True
+
+    seam_mask = vert_in_front & vert_in_back
+    seam_indices = np.where(seam_mask)[0]
+    n_seam = len(seam_indices)
+
+    # ── Duplicate seam vertices ───────────────────────────────────────
+    dup_start = n_orig
+    remap = np.arange(n_orig, dtype=np.int64)
+    if n_seam > 0:
+        remap[seam_indices] = np.arange(dup_start, dup_start + n_seam, dtype=np.int64)
+
+    new_faces = faces.copy()
+    back_mask = ~face_is_front
+    if back_mask.any():
+        new_faces[back_mask] = remap[faces[back_mask]]
+
+    if n_seam > 0:
+        new_verts = np.vstack([verts, verts[seam_indices]])
+    else:
+        new_verts = verts.copy()
+
+    # ── Build UV array ────────────────────────────────────────────────
+    n_total = len(new_verts)
+    uvs = np.zeros((n_total, 2))
+
+    # Default: front UVs for all original vertices
+    uvs[:n_orig, 0] = u_base * 0.5
+    uvs[:n_orig, 1] = v_coord
+
+    # Override back-only vertices to right half
+    back_only = vert_in_back & ~vert_in_front
+    back_only_idx = np.where(back_only)[0]
+    if len(back_only_idx) > 0:
+        uvs[back_only_idx, 0] = 0.5 + u_base[back_only_idx] * 0.5
+
+    # Duplicated seam vertices → right half (back UVs)
+    if n_seam > 0:
+        uvs[dup_start:dup_start + n_seam, 0] = 0.5 + u_base[seam_indices] * 0.5
+        uvs[dup_start:dup_start + n_seam, 1] = v_coord[seam_indices]
+
+    # ── Apply to mesh ─────────────────────────────────────────────────
+    mesh.vertices = new_verts
+    mesh.faces = new_faces
+
+    return np.clip(uvs, 0.0, 1.0), seam_indices
 
 
 def assign_front_projection_uvs(mesh: trimesh.Trimesh) -> np.ndarray:

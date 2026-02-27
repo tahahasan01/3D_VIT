@@ -38,7 +38,9 @@ export function ViewerControls({
   const isSmpl = modelType === "smpl";
 
   const animButtons: { label: string; value: AnimationType }[] = [
-    { label: "T-Pose", value: null },
+    { label: "Natural", value: "natural_stand" },
+    { label: "A-Pose", value: "a_pose" },
+    { label: "T-Pose", value: "t_pose" },
     { label: "Walk", value: "walk" },
     { label: "Twirl", value: "twirl" },
   ];

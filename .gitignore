@@ -32,6 +32,7 @@ server/output/*
 
 # Large model checkpoints (download separately)
 ISP/checkpoints/*.pth
+ISP/checkpoints/*.zip
 ISP/extra-data/*.pt
 ISP/extra-data/*.npz
 ISP/extra-data/fitting-sample/

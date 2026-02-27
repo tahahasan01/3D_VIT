@@ -4,11 +4,22 @@
  * Mirrors the server-side GarmentMeasurements model.
  */
 
-export type GarmentType = "tshirt" | "pants" | "dress";
+export type GarmentType =
+  | "tshirt"
+  | "polo"
+  | "button_down"
+  | "hoodie"
+  | "jacket"
+  | "pants"
+  | "dress";
 
 /** Human-readable labels for garment types. */
 export const GARMENT_TYPE_LABELS: Record<GarmentType, string> = {
   tshirt: "T-Shirt",
+  polo: "Polo",
+  button_down: "Button-Down Shirt",
+  hoodie: "Hoodie",
+  jacket: "Jacket",
   pants: "Pants",
   dress: "Dress",
 };
@@ -59,6 +70,30 @@ export const DEFAULT_GARMENT_MEASUREMENTS: Record<GarmentType, GarmentMeasuremen
     chest_cm: 100,
     length_cm: 72,
     sleeve_length_cm: 24,
+  },
+  polo: {
+    garment_type: "polo",
+    chest_cm: 100,
+    length_cm: 68,
+    sleeve_length_cm: 18,
+  },
+  button_down: {
+    garment_type: "button_down",
+    chest_cm: 100,
+    length_cm: 76,
+    sleeve_length_cm: 62,
+  },
+  hoodie: {
+    garment_type: "hoodie",
+    chest_cm: 104,
+    length_cm: 72,
+    sleeve_length_cm: 58,
+  },
+  jacket: {
+    garment_type: "jacket",
+    chest_cm: 108,
+    length_cm: 78,
+    sleeve_length_cm: 64,
   },
   pants: {
     garment_type: "pants",

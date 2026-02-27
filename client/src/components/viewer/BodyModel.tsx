@@ -4,6 +4,10 @@
  * Loads the model from a blob URL. When the GLB contains a skeleton
  * and animations (SMPL skinned mesh), creates an AnimationMixer to
  * play walk/twirl clips based on the animation store.
+ *
+ * Material is a matte gray (roughness 0.65) matching the classic SMPL
+ * clay-mannequin look. Face texture (material index 1) keeps its own
+ * color and lower roughness.
  */
 
 import { useEffect, useMemo, useRef } from "react";
@@ -13,8 +17,9 @@ import * as THREE from "three";
 import { clone as skeletonClone } from "three/examples/jsm/utils/SkeletonUtils.js";
 import { useAnimationStore } from "../../store/animationStore";
 
+const STATIC_POSES = new Set(["natural_stand", "a_pose", "t_pose"]);
+
 interface BodyModelProps {
-  /** Object URL pointing to the body GLB blob. */
   url: string;
 }
 
@@ -26,10 +31,6 @@ export function BodyModel({ url }: BodyModelProps) {
   const currentActionRef = useRef<THREE.AnimationAction | null>(null);
 
   const cloned = useMemo(() => {
-    // SkeletonUtils.clone properly rebinds SkinnedMesh skeletons to the
-    // cloned bone hierarchy. scene.clone(true) does NOT do this — the
-    // SkinnedMesh skeleton references separate Skeleton.clone() bones,
-    // so AnimationMixer drives the wrong bone set and mesh never deforms.
     let hasSkinned = false;
     scene.traverse((child) => {
       if ((child as THREE.SkinnedMesh).isSkinnedMesh) hasSkinned = true;
@@ -37,59 +38,36 @@ export function BodyModel({ url }: BodyModelProps) {
     const c = hasSkinned ? skeletonClone(scene) : scene.clone(true);
 
     c.traverse((child) => {
-      if (child instanceof THREE.SkinnedMesh) {
-        // Animated vertices can leave the bounding box
+      const isSkinned = (child as THREE.SkinnedMesh).isSkinnedMesh;
+      if (child instanceof THREE.Mesh || isSkinned) {
         child.frustumCulled = false;
         child.geometry.computeVertexNormals();
-        child.renderOrder = 1; // body renders after garments for stencil test
 
         const materials = Array.isArray(child.material)
           ? child.material
           : [child.material];
 
-        for (const mat of materials) {
+        materials.forEach((mat, idx) => {
           if (mat instanceof THREE.MeshStandardMaterial) {
             mat.flatShading = false;
+            mat.metalness = 0.0;
             mat.side = THREE.DoubleSide;
-            // Stencil: only render where garment has NOT drawn (stencil != 1)
-            mat.stencilWrite = false;
-            mat.stencilRef = 1;
-            mat.stencilFunc = THREE.NotEqualStencilFunc;
-            mat.stencilFail = THREE.KeepStencilOp;
-            mat.stencilZFail = THREE.KeepStencilOp;
-            mat.stencilZPass = THREE.KeepStencilOp;
+            if (idx === 0) {
+              // Body primitive: matte gray clay look (matches SMPL reference)
+              mat.roughness = 0.65;
+            } else {
+              // Face primitive: slightly less matte so features read clearly
+              mat.roughness = 0.55;
+            }
             mat.needsUpdate = true;
           }
-        }
-      } else if (child instanceof THREE.Mesh) {
-        child.geometry.computeVertexNormals();
-        child.renderOrder = 1; // body renders after garments for stencil test
-
-        const materials = Array.isArray(child.material)
-          ? child.material
-          : [child.material];
-
-        for (const mat of materials) {
-          if (mat instanceof THREE.MeshStandardMaterial) {
-            mat.flatShading = false;
-            mat.side = THREE.DoubleSide;
-            // Stencil: only render where garment has NOT drawn (stencil != 1)
-            mat.stencilWrite = false;
-            mat.stencilRef = 1;
-            mat.stencilFunc = THREE.NotEqualStencilFunc;
-            mat.stencilFail = THREE.KeepStencilOp;
-            mat.stencilZFail = THREE.KeepStencilOp;
-            mat.stencilZPass = THREE.KeepStencilOp;
-            mat.needsUpdate = true;
-          }
-        }
+        });
       }
     });
 
     return c;
   }, [scene]);
 
-  // Create mixer when scene or animations change
   useEffect(() => {
     if (animations && animations.length > 0) {
       const mixer = new THREE.AnimationMixer(cloned);
@@ -101,39 +79,35 @@ export function BodyModel({ url }: BodyModelProps) {
     }
   }, [cloned, animations]);
 
-  // Switch animation clips based on store state
   useEffect(() => {
     const mixer = mixerRef.current;
     if (!mixer || !animations || animations.length === 0) return;
 
-    // Stop current action
-    if (currentActionRef.current) {
-      currentActionRef.current.fadeOut(0.3);
-    }
+    mixer.stopAllAction();
+    currentActionRef.current = null;
 
-    if (activeAnimation === null) {
-      // T-pose: stop all
-      mixer.stopAllAction();
-      currentActionRef.current = null;
-      return;
-    }
+    const clipName = activeAnimation ?? "natural_stand";
+    const isStatic = STATIC_POSES.has(clipName);
 
-    // Find the clip by name
-    const clip = animations.find((a) => a.name === activeAnimation);
-    if (!clip) {
-      mixer.stopAllAction();
-      currentActionRef.current = null;
-      return;
-    }
+    const clip = animations.find((a) => a.name === clipName);
+    if (!clip) return;
 
     const action = mixer.clipAction(clip);
     action.reset();
-    action.fadeIn(0.3);
+
+    if (isStatic) {
+      action.loop = THREE.LoopOnce;
+      action.clampWhenFinished = true;
+    } else {
+      action.loop = THREE.LoopRepeat;
+    }
+
     action.play();
     currentActionRef.current = action;
+
+    mixer.update(0);
   }, [activeAnimation, animations]);
 
-  // Tick the mixer every frame
   useFrame((_, delta) => {
     if (mixerRef.current) {
       mixerRef.current.update(delta * speed);

@@ -26,11 +26,18 @@ export async function createTryOn(
   image: File,
   bodyMeasurements: BodyMeasurements,
   garmentMeasurements: GarmentMeasurements,
+  additionalImages?: File[],
 ): Promise<CreateTryOnResult> {
   const formData = new FormData();
   formData.append("garment_image", image);
   formData.append("body_measurements", JSON.stringify(bodyMeasurements));
   formData.append("garment_measurements", JSON.stringify(garmentMeasurements));
+
+  if (additionalImages) {
+    for (const file of additionalImages) {
+      formData.append("additional_images", file);
+    }
+  }
 
   const response = await fetch(`${API_BASE_URL}/tryon/create`, {
     method: "POST",

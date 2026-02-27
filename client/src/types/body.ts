@@ -28,7 +28,12 @@ export interface BodyMeasurements {
   use_base_mesh?: boolean;
   /** If true, use SMPL body model (male/female) from server assets, scaled to height; requires SMPL registration. */
   use_smpl?: boolean;
+  /** Optional skin color as hex (e.g. "#DEC3AA"). Applied as body base color when set. */
+  skin_color_hex?: string | null;
 }
+
+/** Default skin color (hex) when not specified. */
+export const DEFAULT_SKIN_COLOR_HEX = "#E8C4A0";
 
 /** Default male body measurements for form initialisation. */
 export const DEFAULT_MALE_MEASUREMENTS: BodyMeasurements = {
@@ -42,6 +47,7 @@ export const DEFAULT_MALE_MEASUREMENTS: BodyMeasurements = {
   inseam_cm: 80,
   use_base_mesh: false,
   use_smpl: true, // Use SMPL when available so garments conform to body
+  skin_color_hex: DEFAULT_SKIN_COLOR_HEX,
 };
 
 /** Default female body measurements for form initialisation. */
@@ -56,4 +62,5 @@ export const DEFAULT_FEMALE_MEASUREMENTS: BodyMeasurements = {
   inseam_cm: 75,
   use_base_mesh: false,
   use_smpl: true,
+  skin_color_hex: DEFAULT_SKIN_COLOR_HEX,
 };

@@ -6,13 +6,26 @@ a set of body measurements.
 
 import json
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
 
 from ..models.body import BodyMeasurements
 from ..services.body_generator import generate_body
 
 router = APIRouter(prefix="/body", tags=["body"])
+
+
+# #region agent log
+@router.post("/debug-log")
+async def debug_log_relay(request: Request):
+    """Relay frontend debug logs to the backend log file."""
+    import time as _t
+    body = await request.json()
+    _lp = r"c:\Users\Syed Taha Hasan\Desktop\Vit\debug-6b80da.log"
+    with open(_lp, "a") as f:
+        f.write(json.dumps({**body, "relayed": True, "timestamp": int(_t.time() * 1000)}) + "\n")
+    return {"ok": True}
+# #endregion
 
 
 @router.post(

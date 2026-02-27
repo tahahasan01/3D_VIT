@@ -49,8 +49,9 @@ export function TryOnPage() {
       image: File,
       measurements: GarmentMeasurements,
       options?: GarmentSubmitOptions,
+      additionalImages?: File[],
     ) => {
-      await process(image, measurements, options);
+      await process(image, measurements, options, additionalImages);
       setStepIndex(2);
     },
     [process],

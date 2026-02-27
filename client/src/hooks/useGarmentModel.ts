@@ -24,6 +24,7 @@ interface UseGarmentModelReturn {
     image: File,
     measurements: GarmentMeasurements,
     options?: GarmentSubmitOptions,
+    additionalImages?: File[],
   ) => Promise<void>;
 }
 
@@ -51,6 +52,7 @@ export function useGarmentModel(): UseGarmentModelReturn {
       image: File,
       measurements: GarmentMeasurements,
       _options?: GarmentSubmitOptions,
+      additionalImages?: File[],
     ) => {
       setIsProcessing(true);
       setError(null);
@@ -58,7 +60,7 @@ export function useGarmentModel(): UseGarmentModelReturn {
       try {
         // Combined try-on when we have body measurements: one request builds body + garment
         if (bodyMeasurements) {
-          const result = await createTryOn(image, bodyMeasurements, measurements);
+          const result = await createTryOn(image, bodyMeasurements, measurements, additionalImages);
           const bodyUrl = base64ToBlobUrl(result.body_glb_base64, "model/gltf-binary");
           const garmentUrl = base64ToBlobUrl(result.garment_glb_base64, "model/gltf-binary");
           setModelUrl(bodyUrl);

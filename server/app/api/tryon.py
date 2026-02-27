@@ -21,9 +21,27 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/tryon", tags=["tryon"])
 
 
+def _body_skin_color_factor(body_m: BodyMeasurements) -> list[float] | None:
+    """Return [r, g, b, 1] from body_m.skin_color_hex if set, else None (use default)."""
+    hex_str = getattr(body_m, "skin_color_hex", None)
+    if not hex_str or not isinstance(hex_str, str):
+        return None
+    hex_str = hex_str.strip().lstrip("#")
+    if len(hex_str) != 6:
+        return None
+    try:
+        r = int(hex_str[0:2], 16) / 255.0
+        g = int(hex_str[2:4], 16) / 255.0
+        b = int(hex_str[4:6], 16) / 255.0
+        return [r, g, b, 1.0]
+    except ValueError:
+        return None
+
+
 @router.post("/create")
 async def create_tryon(
     garment_image: UploadFile = File(..., description="2D photograph of the outfit (flat garment image)"),
+    additional_images: list[UploadFile] = File(default=[], description="Optional extra angle photos (back, side, detail)"),
     body_measurements: str = Form(..., description="JSON string of BodyMeasurements"),
     garment_measurements: str = Form(..., description="JSON string of GarmentMeasurements"),
 ) -> dict:
@@ -47,6 +65,20 @@ async def create_tryon(
             detail=f"Image exceeds {MAX_UPLOAD_SIZE_MB} MB limit.",
         )
 
+    additional_image_bytes: list[bytes] = []
+    for extra in additional_images:
+        if extra.content_type not in ALLOWED_IMAGE_TYPES:
+            logger.warning("Skipping additional image with unsupported type: %s", extra.content_type)
+            continue
+        data = await extra.read()
+        if len(data) > max_bytes:
+            logger.warning("Skipping additional image that exceeds size limit")
+            continue
+        additional_image_bytes.append(data)
+
+    if additional_image_bytes:
+        logger.info("Received %d additional angle image(s)", len(additional_image_bytes))
+
     try:
         body_m = BodyMeasurements(**json.loads(body_measurements))
     except (json.JSONDecodeError, ValueError) as exc:
@@ -64,15 +96,18 @@ async def create_tryon(
         logger.exception("Body generation failed")
         raise HTTPException(status_code=500, detail=f"Body generation failed: {exc}") from exc
 
-    # Step 2: Build skinned body GLB
+    # Step 2: Build skinned body GLB (with face texture and skin color when SMPL)
     try:
         if skinning_data is not None:
             from ..services.skinned_glb_builder import build_skinned_glb
+            base_color = _body_skin_color_factor(body_m)
             body_glb = build_skinned_glb(
                 body_mesh,
                 skinning_data["weights"],
                 skinning_data["kintree_parents"],
                 skinning_data["joints_positions"],
+                head_face_indices=skinning_data.get("head_face_indices"),
+                base_color_factor=base_color,
             )
         else:
             body_glb = body_mesh.export(file_type="glb")
@@ -96,6 +131,7 @@ async def create_tryon(
             body_measurements=body_m.model_dump(),
             body_mesh=body_mesh,
             height_m=body_m.height_cm / 100.0,
+            additional_images=additional_image_bytes or None,
         )
     except Exception as exc:
         logger.exception("Garment processing failed")

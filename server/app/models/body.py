@@ -69,6 +69,10 @@ class BodyMeasurements(BaseModel):
         default=False,
         description="If true, use SMPL body model (male/female) from assets/smpl, scaled to height; requires SMPL registration",
     )
+    skin_color_hex: str | None = Field(
+        default=None,
+        description="Optional skin color as hex e.g. '#DEC3AA'. When set, used as body base color in GLB.",
+    )
 
     model_config = {"json_schema_extra": {"examples": [
         {

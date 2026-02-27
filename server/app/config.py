@@ -37,3 +37,11 @@ CORS_ORIGINS: list[str] = os.getenv(
 # ---------------------------------------------------------------------------
 MAX_UPLOAD_SIZE_MB: int = int(os.getenv("MAX_UPLOAD_SIZE_MB", "10"))
 ALLOWED_IMAGE_TYPES: set[str] = {"image/jpeg", "image/png", "image/webp"}
+
+# ---------------------------------------------------------------------------
+# FabricDiffusion (optional PBR texture rectification)
+# ---------------------------------------------------------------------------
+USE_FABRIC_DIFFUSION: bool = os.getenv("USE_FABRIC_DIFFUSION", "0").strip().lower() in ("1", "true", "yes")
+FABRIC_DIFFUSION_ROOT: str | None = os.getenv("FABRIC_DIFFUSION_ROOT", "").strip() or None
+FABRIC_DIFFUSION_PYTHON: str | None = os.getenv("FABRIC_DIFFUSION_PYTHON", "").strip() or None
+FABRIC_DIFFUSION_TIMEOUT: int = int(os.getenv("FABRIC_DIFFUSION_TIMEOUT", "120"))

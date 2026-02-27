@@ -64,6 +64,28 @@ _LIMB_SECTIONS = 20    # cross-sections per limb
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _skin_color_factor(measurements: BodyMeasurements) -> list[float] | None:
+    """Return [r, g, b, 1] from measurements.skin_color_hex if set, else None."""
+    hex_str = getattr(measurements, "skin_color_hex", None)
+    if not hex_str or not isinstance(hex_str, str):
+        return None
+    hex_str = hex_str.strip().lstrip("#")
+    if len(hex_str) != 6:
+        return None
+    try:
+        r = int(hex_str[0:2], 16) / 255.0
+        g = int(hex_str[2:4], 16) / 255.0
+        b = int(hex_str[4:6], 16) / 255.0
+        return [r, g, b, 1.0]
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -127,17 +149,54 @@ def generate_body(measurements: BodyMeasurements) -> tuple[bytes, dict | None, s
     When SMPL is used, exports a skinned+animated GLB.
     Returns (glb_bytes, landmarks, model_type).
     """
+    import logging
+    log = logging.getLogger(__name__)
+
+    # #region agent log
+    import json as _j, time as _t
+    _lp = r"c:\Users\Syed Taha Hasan\Desktop\Vit\debug-6b80da.log"
+    def _dlog2(msg, data, hid):
+        try:
+            with open(_lp, "a") as _f:
+                _f.write(_j.dumps({"sessionId":"6b80da","location":"body_generator.py","message":msg,"data":data,"timestamp":int(_t.time()*1000),"hypothesisId":hid})+"\n")
+        except Exception as _e:
+            log.error("_dlog2 failed: %s", _e)
+    _dlog2("generate_body called", {"use_smpl": getattr(measurements, "use_smpl", None), "use_base_mesh": getattr(measurements, "use_base_mesh", None), "skin_color_hex": getattr(measurements, "skin_color_hex", None)}, "PATH")
+    # #endregion
+
     mesh, landmarks, skinning_data = get_body_mesh(measurements)
+    # #region agent log
+    _dlog2("get_body_mesh returned", {"skinning_data_is_none": skinning_data is None, "has_landmarks": landmarks is not None}, "PATH")
+    # #endregion
     if skinning_data is not None:
         from .skinned_glb_builder import build_skinned_glb
+        base_color = _skin_color_factor(measurements)
+        head_fi = skinning_data.get("head_face_indices")
+        log.info(
+            "generate_body: skin_color_hex=%r, base_color=%s, head_face_indices=%s",
+            getattr(measurements, "skin_color_hex", None),
+            base_color,
+            f"({len(head_fi)} faces)" if head_fi is not None else None,
+        )
+        # #region agent log
+        _dlog2("calling build_skinned_glb", {"base_color": base_color, "head_fi_len": len(head_fi) if head_fi is not None else None}, "PATH")
+        # #endregion
         glb_data = build_skinned_glb(
             mesh,
             skinning_data["weights"],
             skinning_data["kintree_parents"],
             skinning_data["joints_positions"],
+            head_face_indices=head_fi,
+            base_color_factor=base_color,
         )
+        # #region agent log
+        _dlog2("build_skinned_glb returned", {"glb_size": len(glb_data)}, "PATH")
+        # #endregion
         return glb_data, landmarks, "smpl"
     else:
+        # #region agent log
+        _dlog2("using non-SMPL path (mesh.export)", {"use_base_mesh": getattr(measurements, "use_base_mesh", None)}, "PATH")
+        # #endregion
         glb_data = mesh.export(file_type="glb")
         model_type = "base_mesh" if getattr(measurements, "use_base_mesh", False) else "parametric"
         return glb_data, landmarks, model_type
