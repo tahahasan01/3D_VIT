@@ -1,0 +1,11 @@
+Place the screenshot image here to be displayed in the README.
+
+1) Rename the attached image from the chat to `virtual_tryon.png` and save it at:
+
+   assets/virtual_tryon.png
+
+2) Supported formats: PNG, JPG. Prefer PNG for lossless quality.
+
+3) After adding the file, commit and push. The README already references this path.
+
+If you want me to add the actual image file, upload the image file (PNG/JPG) to the workspace and I will place it at the correct path and push it for you.
